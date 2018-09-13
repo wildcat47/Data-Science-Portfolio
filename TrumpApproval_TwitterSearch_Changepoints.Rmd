@@ -1,0 +1,263 @@
+---
+title: "Changepoints in Trump Approval Ratings"
+author: "Nate Wilairat"
+date: "9/11/2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(readr)
+library(changepoint)
+library(changepoint.np)
+library(tidyverse)
+# library(rtweet)
+# library(rtimes)
+library(lubridate)
+library(gtrendsR)
+library(zoo)
+library(forecast)
+library(gridExtra)
+
+# import data
+trumpapproval <- read_csv("https://projects.fivethirtyeight.com/trump-approval-data/approval_topline.csv")
+trumpapproval$modeldate <- as.POSIXct(trumpapproval$modeldate, tz="", format = "%m/%d/%Y")
+
+twitsearch <- gtrends("Trump twitter", geo="US", time = "2017-01-01 2018-09-11")
+cali <- gtrends("Trump twitter", geo="US-CA", time = "2017-01-01 2018-09-11")
+texas <- gtrends("Trump twitter", geo="US-TX", time = "2017-01-01 2018-09-11")
+ohio <- gtrends("Trump twitter", geo="US-OH", time = "2017-01-01 2018-09-11")
+tenn <- gtrends("Trump twitter", geo="US-TN", time = "2017-01-01 2018-09-11")
+
+cali_search <- cali$interest_over_time %>% dplyr::filter(date > mdy(01232017)) %>% mutate(source = "California", value=as.numeric(hits)) %>% select(date, value, source)
+texas_search <- texas$interest_over_time %>% dplyr::filter(date > mdy(01232017)) %>% mutate(source = "Texas", value=as.numeric(hits)) %>% select(date, value, source)
+oh_search <- ohio$interest_over_time %>% dplyr::filter(date > mdy(01232017)) %>% mutate(source = "Ohio", value=as.numeric(hits)) %>% select(date, value, source)
+tn_search <- ohio$interest_over_time %>% dplyr::filter(date > mdy(01232017)) %>% mutate(source = "Tennessee", value=as.numeric(hits)) %>% select(date, value, source)
+```
+
+## EDA
+
+```{r app, echo=FALSE}
+# Clean Data
+
+matchtwitsearch <- twitsearch$interest_over_time %>% dplyr::filter(date > mdy(01232017)) %>% mutate(source = "Search for Trump Twitter", value=as.numeric(hits)) %>% select(date, value, source)
+
+# EDA
+ggplot(matchtwitsearch) + geom_line(aes(x=date, y=value))
+
+ggplot(matchtwitsearch) + geom_histogram(aes(x=value))
+
+# Identify threshold values
+searchthresh = vector()
+for (i in 1:nrow(matchtwitsearch)){
+  if (i==1 & matchtwitsearch$value[i]>40){
+    searchthresh <- c(searchthresh, format(matchtwitsearch$date[i], "%m/%d/%Y"))
+  } else if (i==1 & matchtwitsearch$value[i]<=40){
+  }
+  else if (i==2 & matchtwitsearch$value[i]>40 & matchtwitsearch$value[i-1]<40 & matchtwitsearch$value[i-1]<matchtwitsearch$value[i]){
+    searchthresh <- c(searchthresh, format(matchtwitsearch$date[i], "%m/%d/%Y"))
+  } 
+  else if (i==2 & (matchtwitsearch$value[i]<=40 | matchtwitsearch$value[i-1]>=matchtwitsearch$value[i] | matchtwitsearch$value[i-1]>=40)){
+  }
+    else if (i==nrow(matchtwitsearch) & matchtwitsearch$value[i]>40 & matchtwitsearch$value[i-1]<40 & matchtwitsearch$value[i-1]<matchtwitsearch$value[i]){
+      searchthresh <- c(searchthresh, format(matchtwitsearch$date[i], "%m/%d/%Y"))
+    }
+  else if (i==nrow(matchtwitsearch) & (matchtwitsearch$value[i]<=40 | matchtwitsearch$value[i-1]>=matchtwitsearch$value[i] | matchtwitsearch$value[i-1]>=40)){
+  }
+  else if (i>2 & matchtwitsearch$value[i]>40 & matchtwitsearch$value[i-1]<40 & matchtwitsearch$value[i-1]<matchtwitsearch$value[i] & matchtwitsearch$value[i-2]<40 & matchtwitsearch$value[i-2]<matchtwitsearch$value[i]){
+    searchthresh <- c(searchthresh, format(matchtwitsearch$date[i], "%m/%d/%Y"))
+  } else {}
+}
+searchthresh <- as.POSIXct(searchthresh, tz="", format = "%m/%d/%Y")
+
+
+# Additional EDA - Compare across states
+ggplot(rbind(cali_search, texas_search, oh_search, tn_search, (matchtwitsearch %>% mutate(source = "Overall US Searches")))) + geom_line(aes(x=date, y=value, color=source)) + xlab("Date") + ylab("Search Popularity") + ggtitle('Google Search Trends for "Trump Twitter"')
+
+# First look at approval
+ggplot(dplyr::filter(trumpapproval, subgroup=="All polls"), aes(x=modeldate, y=approve_estimate)) + geom_line() + xlab("Date") + ylab("Approval Rating") + ggtitle("FiveThirtyEight Estimated Approval Rating for Pres. Trump") + geom_ribbon(aes(ymin=approve_lo, ymax=approve_hi), alpha=0.2)
+
+# Combine data frames, calculate z-scores, and plot standardized values
+
+combined_df <- dplyr::filter(trumpapproval, subgroup=="All polls") %>% arrange(modeldate) %>% mutate(date = modeldate, source="Approval", value=approve_estimate) %>% select(date, value, source)
+
+combined_df <- rbind(combined_df, matchtwitsearch)
+
+combined_df <- combined_df %>% group_by(source) %>% mutate(zscore = (value - mean(value, na.rm = TRUE))/sd(value, na.rm = TRUE))
+
+ggplot(combined_df, aes(x=date, y=value, color=source)) + geom_line()
+
+ggplot(dplyr::filter(combined_df, source=="Approval" | source == "Search for Trump Twitter"), aes(x=date, y=zscore, color=source)) + geom_line() + xlab("Date") + ylab("Z-Score") + ggtitle("Normalized Approval & Search Trend")
+```
+
+## EDA on Differenced Data
+```{r ts, echo=FALSE}
+# EDA on lag1-differenced data
+
+lag1diff <- diff((filter(trumpapproval, subgroup=="All polls") %>% filter(modeldate>mdy(03202017)) %>%  arrange(modeldate))$approve_estimate)
+diffs <- as.data.frame(lag1diff)
+diffs$index <- as.numeric(row.names(diffs))
+
+g1 <- ggplot(diffs, aes(x=index, y=lag1diff)) + geom_line() + ylab("Change in Approval From Previous") + xlab("Time") + ggtitle("Changes in Approval (Lag-1 differenced approval)")
+  
+g2 <- ggplot(diffs) + geom_histogram(aes(x=lag1diff)) + xlab("Change in Approval From Previous") + ylab("Count") + ggtitle("Histogram of Changes in Approval")
+
+grid.arrange(g1, g2, nrow=1)
+
+```
+
+## Time Series Regression
+```{r tsreg, echo=FALSE}
+# Convert to weekly approval
+
+weekly <- combined_df %>% dplyr::filter(source=="Approval") %>% mutate(week = cut(date, "week", start.on.monday = FALSE)) %>% group_by(week) %>% summarize(value = mean(value), source = first(source)) %>% mutate(date = as.Date(as.character(week)))
+
+zs <- zoo((combined_df %>% dplyr::filter(source=="Search for Trump Twitter") %>% select(value, date))$value, as.Date((combined_df %>% dplyr::filter(source=="Search for Trump Twitter") %>% select(value, date))$date))
+za <- zoo(weekly$value, weekly$date)
+
+z <- merge(zs,za)
+plot(z)
+
+# Calculate lagged covariates
+mod <- cbind(Search0 = as.ts(zs),
+             Search1 = stats::lag(as.ts(zs), -1),
+             Search2 = stats::lag(as.ts(zs), -2),
+             Search3 = stats::lag(as.ts(zs), -3),
+             Search4 = stats::lag(as.ts(zs), -4))
+
+
+# Subset the training data
+mod_train <- mod[1:60,]
+y_train <- as.ts(z$za[1:60])
+y <- as.ts(z$za)
+
+fit1 <- auto.arima(y_train, xreg=mod_train[,1:1])
+fit2 <- auto.arima(y_train, xreg=mod_train[,1:2])
+fit3 <- auto.arima(y_train, xreg=mod_train[,1:3])
+fit4 <- auto.arima(y_train, xreg=mod_train[,1:4])
+fit5 <- auto.arima(y_train, xreg=mod_train[,1:5])
+fit6 <- auto.arima(y_train, xreg=mod_train[,1:6])
+fit7 <- auto.arima(y_train, xreg=mod_train[,1:7])
+
+# How many diffs are needed to make the series stationary?
+ndiffs(y, test="kpss") 
+ndiffs(as.ts(matchtwitsearch$value), test="kpss")
+
+# So not stationary. But what if we assume stationarity?
+
+fit1_2 <- auto.arima(y_train, xreg=mod_train[,1:1], stationary = TRUE)
+fit2_2 <- auto.arima(y_train, xreg=mod_train[,1:2], stationary = TRUE)
+fit3_2 <- auto.arima(y_train, xreg=mod_train[,1:3], stationary = TRUE)
+fit4_2 <- auto.arima(y_train, xreg=mod_train[,1:4], stationary = TRUE)
+
+c(fit1[["aicc"]],fit2[["aicc"]],fit3[["aicc"]],fit4[["aicc"]])
+c(fit1_2[["aicc"]],fit2_2[["aicc"]],fit3_2[["aicc"]],fit4_2[["aicc"]])
+
+summary(fit1)
+summary(fit2)
+summary(fit3)
+summary(fit4)
+
+# Predict and plot predictions
+pred= forecast(fit4, h=20, xreg=mod[60:nrow(mod), 1:4])
+autoplot(pred) + geom_line(data = (dplyr::filter(combined_df, source=="Approval" & date>mdy("03082018")) %>% mutate(date = as.numeric(as.Date(date)))), aes(x=date, y=value), color = "grey") + ylab("Approval")
+```
+
+## Normal theory changepoints
+
+```{r cp, echo=FALSE}
+cpt_mean_norm <- cpt.mean((filter(trumpapproval, subgroup=="All polls") %>% arrange(modeldate))$approve_estimate, method="PELT",test.stat="Normal")
+plot(cpt_mean_norm)
+chgpts <- cpt.mean((filter(trumpapproval, subgroup=="All polls") %>% arrange(modeldate))$approve_estimate, method="PELT",test.stat="Normal", class=FALSE)
+dates = as.POSIXct(rep(NA, length(chgpts)))
+adjdates = as.POSIXct(rep(NA, length(chgpts)))
+means=rep(NA, length(chgpts))
+centeredmeans=rep(NA, length(chgpts))
+centeredapproval <- filter(trumpapproval, subgroup=="All polls") %>% arrange(modeldate) %>% mutate(date = modeldate, source="Approval", value=approve_estimate) %>% select(date, value, source) %>% mutate(zscore = (value - mean(value))/sd(value))
+for (i in 1:length(chgpts)){ 
+  dates[i] = (filter(trumpapproval, subgroup=="All polls") %>% arrange(modeldate))$modeldate[chgpts[i]]
+  adjdates[i] = dates[i] - days(3)
+  means[i] = ifelse(i==1, mean((filter(trumpapproval, subgroup=="All polls") %>% arrange(modeldate))$approve_estimate[1:chgpts[i]]),
+                 mean((filter(trumpapproval, subgroup=="All polls") %>% arrange(modeldate))$approve_estimate[chgpts[i-1]:chgpts[i]]))
+  centeredmeans[i] = ifelse(i==1, mean(centeredapproval$zscore[1:chgpts[i]]),
+                 mean(centeredapproval$zscore[chgpts[i-1]:chgpts[i]]))
+}
+
+
+ggplot(dplyr::filter(combined_df, source=="Approval" | source == "Search for Trump Twitter"), aes(x=date, y=zscore, color=source)) + geom_line() + geom_segment(aes(x=min(combined_df$date),xend=dates[1],y=centeredmeans[1],yend=centeredmeans[1]), color="#FF9999") + geom_segment(aes(x=dates[1],xend=dates[2],y=centeredmeans[2],yend=centeredmeans[2]), color="#FF9999") + geom_segment(aes(x=dates[2],xend=dates[3],y=centeredmeans[3],yend=centeredmeans[3]), color="#FF9999") + geom_segment(aes(x=dates[3],xend=dates[4],y=centeredmeans[4],yend=centeredmeans[4]), color="#FF9999") + geom_segment(aes(x=dates[4],xend=dates[5],y=centeredmeans[5],yend=centeredmeans[5]), color="#FF9999") + geom_segment(aes(x=dates[5],xend=dates[6],y=centeredmeans[6],yend=centeredmeans[6]), color="#FF9999") + geom_segment(aes(x=dates[6],xend=dates[7],y=centeredmeans[7],yend=centeredmeans[7]), color="#FF9999") + geom_segment(aes(x=dates[7],xend=dates[8],y=centeredmeans[8],yend=centeredmeans[8]), color="#FF9999") + geom_segment(aes(x=dates[8],xend=dates[9],y=centeredmeans[9],yend=centeredmeans[9]), color="#FF9999") + geom_vline(aes(xintercept=searchthresh[1])) + geom_vline(aes(xintercept=searchthresh[2])) + geom_vline(aes(xintercept=searchthresh[3])) + geom_vline(aes(xintercept=searchthresh[4])) + geom_vline(aes(xintercept=searchthresh[5])) + geom_vline(aes(xintercept=searchthresh[6])) + geom_vline(aes(xintercept=searchthresh[7])) + geom_vline(aes(xintercept=searchthresh[8])) + geom_vline(aes(xintercept=searchthresh[9])) +
+    theme(legend.position="bottom")
+```
+
+## Non-parametric changepoints
+
+```{r npcp, echo=FALSE}
+cpt_np <- cpt.np((dplyr::filter(trumpapproval, subgroup=="All polls") %>% arrange(modeldate))$approve_estimate, method="PELT",test.stat="empirical_distribution")
+plot(cpt_np)
+
+chgpts_np <- cpt.np((dplyr::filter(trumpapproval, subgroup=="All polls") %>% arrange(modeldate))$approve_estimate, method="PELT",test.stat="empirical_distribution", class=FALSE)
+dates_np = as.POSIXct(rep(NA, length(chgpts_np)))
+adjdates_np = as.POSIXct(rep(NA, length(chgpts_np)))
+means_np=rep(NA, length(chgpts_np))
+centeredmeans_np=rep(NA, length(chgpts_np))
+centeredapproval <- dplyr::filter(trumpapproval, subgroup=="All polls") %>% arrange(modeldate) %>% mutate(date = modeldate, source="Approval", value=approve_estimate) %>% select(date, value, source) %>% mutate(zscore = (value - mean(value))/sd(value))
+
+for (i in 1:length(chgpts_np)){ 
+  dates_np[i] = (dplyr::filter(trumpapproval, subgroup=="All polls") %>% arrange(modeldate))$modeldate[chgpts_np[i]]
+  adjdates_np[i] = dates_np[i] - days(3)
+  means_np[i] = ifelse(i==1, mean((dplyr::filter(trumpapproval, subgroup=="All polls") %>% arrange(modeldate))$approve_estimate[1:chgpts_np[i]]),
+                 mean((dplyr::filter(trumpapproval, subgroup=="All polls") %>% arrange(modeldate))$approve_estimate[chgpts_np[i-1]:chgpts_np[i]]))
+  centeredmeans_np[i] = ifelse(i==1, mean(centeredapproval$zscore[1:chgpts_np[i]]),
+                 mean(centeredapproval$zscore[chgpts_np[i-1]:chgpts_np[i]]))
+}
+
+
+# Assign labels based on:
+# https://www.newsday.com/news/nation/donald-trump-s-noteworthy-tweets-as-president-1.12632966
+# and http://www.trumptwitterarchive.com
+
+search_label = c("Inauguration, Travel ban", "Comey firing","Trump tower meeting, Iran threat","NFL anthem protests, Vegas mass shooting, Rocket Man","Manhattan truck attack","Anti-Muslim videos","North Korea nuclear button, Stable genius", "Comey book, Syria airstrike", "McCain death")
+
+search_df = data.frame(searchthresh = searchthresh, search_label = search_label)
+
+# Plot everything!
+
+ggplot(dplyr::filter(combined_df, source=="Approval" | source == "Search for Trump Twitter"), aes(x=date, y=zscore, color=source)) + geom_line() + geom_segment(aes(x=min(combined_df$date),xend=dates_np[1],y=centeredmeans_np[1],yend=centeredmeans_np[1]), color="#FF9999") + geom_segment(aes(x=dates_np[1],xend=dates_np[2],y=centeredmeans_np[2],yend=centeredmeans_np[2]), color="#FF9999") + geom_segment(aes(x=dates_np[2],xend=dates_np[3],y=centeredmeans_np[3],yend=centeredmeans_np[3]), color="#FF9999") + geom_segment(aes(x=dates_np[3],xend=dates_np[4],y=centeredmeans_np[4],yend=centeredmeans_np[4]), color="#FF9999") + geom_segment(aes(x=dates_np[4],xend=dates_np[5],y=centeredmeans_np[5],yend=centeredmeans_np[5]), color="#FF9999") + geom_segment(aes(x=dates_np[5],xend=dates_np[6],y=centeredmeans_np[6],yend=centeredmeans_np[6]), color="#FF9999") + geom_segment(aes(x=dates_np[6],xend=dates_np[7],y=centeredmeans_np[7],yend=centeredmeans_np[7]), color="#FF9999") + geom_segment(aes(x=dates_np[7],xend=dates_np[8],y=centeredmeans_np[8],yend=centeredmeans_np[8]), color="#FF9999") + geom_segment(aes(x=dates_np[8],xend=dates_np[9],y=centeredmeans_np[9],yend=centeredmeans_np[9]), color="#FF9999") + geom_segment(aes(x=dates_np[9],xend=dates_np[10],y=centeredmeans_np[10],yend=centeredmeans_np[10]), color="#FF9999") + geom_segment(aes(x=dates_np[10],xend=dates_np[11],y=centeredmeans_np[11],yend=centeredmeans_np[11]), color="#FF9999") + geom_segment(aes(x=dates_np[11],xend=dates_np[12],y=centeredmeans_np[12],yend=centeredmeans_np[12]), color="#FF9999") + geom_vline(data = as.data.frame(searchthresh), aes(xintercept=searchthresh), color = "#00BFC4", linetype="dotted") + geom_text(data = search_df, aes(x=searchthresh, y=4, label=search_label), colour = "black", size=3, angle=90, vjust=-0.6, hjust="right") + xlab("Date") + ylab("Z-Score") + theme(legend.position="bottom") + ggtitle("Searches for \"Trump Twitter\" and Changepoints in Pres. Trump's Approval Rating")
+
+# Calculate a rough RMSE
+
+min_days_from_chgpt_np = vector()
+for (i in 1:length(searchthresh)){
+  days_vec = rep(NA, length(dates_np))
+  for (j in 1:length(dates_np)){
+    days_vec[j] = interval(searchthresh[i], dates_np[j])/days(1)
+  }
+  min_days_from_chgpt_np <- c(min_days_from_chgpt_np,days_vec[which.min(abs(days_vec))])
+}
+
+min_days_from_chgpt = vector()
+for (i in 1:length(searchthresh)){
+  days_vec = rep(NA, length(dates))
+  for (j in 1:length(dates)){
+    days_vec[j] = interval(searchthresh[i], dates[j])/days(1)
+  }
+  min_days_from_chgpt <- c(min_days_from_chgpt,days_vec[which.min(abs(days_vec))])
+}
+
+sqrt(mean(min_days_from_chgpt^2))
+sqrt(mean(min_days_from_chgpt_np^2))
+```
+
+## Changepoint Analysis on Differenced Data
+
+```{r diffs, echo=FALSE}
+# Not much detected
+
+cpt_diff_mean_norm <- cpt.mean(diffs$lag1diff, method="PELT",test.stat="Normal")
+plot(cpt_diff_mean_norm)
+
+cpt_diff_np <- cpt.np(diffs$lag1diff, method="PELT",test.stat="empirical_distribution")
+plot(cpt_diff_np)
+
+cpt_diff_var_norm <- cpt.var(diffs$lag1diff, method="PELT",test.stat="Normal")
+plot(cpt_diff_var_norm)
+```
