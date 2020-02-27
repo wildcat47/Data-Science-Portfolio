@@ -1,0 +1,6 @@
+library(feather)
+library(dplyr)
+cumulative_2006_2018 <- readRDS("~/Documents/Elections/cumulative_2006_2018.Rds")
+load("/Users/nwilairat/Downloads/CCES16_Common_OUTPUT_Feb2018_VV.RData")
+x = x %>% dplyr::select(V101, CC16_316, CC16_326, CC16_326_t, CC16_327, CC16_328, CC16_364, CC16_364c)
+write_feather(x, 'elections_2018.feather')
